@@ -40,8 +40,10 @@ cargo bench -p dogwood-performance --bench stateless_decide
 # Stateless decisions at scale: decide_last against the durable engine on every
 # (or a sample of every) prefix of a trajectory corpus and of synthetic
 # histories, then a single-threaded latency pass. Exits non-zero on any mismatch.
+# --merge also interleaves K corpus trajectories into one history (several
+# sessions at once) and checks each member's outcomes are those it has alone.
 cargo run --release -p dogwood-performance --bin stateless_diff -- \
-    --corpus DIR --synthetic [--prefixes all|N] [--threads K] [--durable-dir DIR]
+    --corpus DIR --synthetic [--merge 2,5,10] [--prefixes all|N] [--threads K] [--durable-dir DIR]
 ```
 
 `stateless_diff`'s corpus is a directory of `manifest.jsonl` (one `{"id",

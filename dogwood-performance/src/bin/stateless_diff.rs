@@ -37,11 +37,24 @@
 //! nanoseconds) at several sizes and policy counts, pinned and unpinned, plus a
 //! seeded mixed history per configuration with tied timestamps and window edges.
 //!
+//! # Several sessions at once
+//!
+//! A real trajectory is one conversation, so it exercises one principal's
+//! history at a time. `--merge 2,5,10` adds merged trajectories: `K`
+//! consecutive corpus trajectories of the same source and policy set,
+//! interleaved as if their conversations ran at once (each shifted to start at
+//! the same instant, keeping its own gaps). Each merged trajectory is checked
+//! like any other, stateless against stateful on every prefix, and also for
+//! **isolation**: every member replayed alone, at the timestamps it had in the
+//! merged history, must reach exactly the outcomes it reached there. Under a
+//! principal pin, the members' events must be invisible to each other. Groups
+//! whose members share a principal are counted and not checked for isolation.
+//!
 //! # Usage
 //!
 //! ```text
 //! cargo run --release -p dogwood-performance --bin stateless_diff -- \
-//!     [--corpus DIR] [--synthetic] [--prefixes all|<N>] [--threads <K>] \
+//!     [--corpus DIR] [--synthetic] [--merge K,…] [--prefixes all|<N>] [--threads <K>] \
 //!     [--latency-trajectories <N>] [--durable-dir <DIR>] [--report <FILE>]
 //! ```
 //!
@@ -87,6 +100,14 @@ struct Trajectory {
     source: String,
     bundle: usize,
     events: Vec<Event>,
+    /// For a merged trajectory: each original trajectory and the positions of
+    /// its events in `events`. Empty otherwise.
+    members: Vec<Member>,
+}
+
+struct Member {
+    id: String,
+    indices: Vec<usize>,
 }
 
 struct Config {
@@ -97,6 +118,8 @@ struct Config {
     latency_trajectories: usize,
     durable_dir: Option<PathBuf>,
     report: Option<PathBuf>,
+    /// Group sizes for merged corpus trajectories (`--merge 2,5,10`).
+    merge: Vec<usize>,
 }
 
 impl Config {
@@ -111,6 +134,7 @@ impl Config {
             latency_trajectories: 100,
             durable_dir: None,
             report: None,
+            merge: Vec::new(),
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -144,6 +168,15 @@ impl Config {
                 }
                 "--durable-dir" => c.durable_dir = Some(PathBuf::from(value(&mut i))),
                 "--report" => c.report = Some(PathBuf::from(value(&mut i))),
+                "--merge" => {
+                    c.merge = value(&mut i)
+                        .split(',')
+                        .map(|k| match k.trim().parse() {
+                            Ok(k) if k >= 2 => k,
+                            _ => usage("--merge <K>[,<K>…] with every K at least 2"),
+                        })
+                        .collect()
+                }
                 other => usage(&format!("unknown argument {other}")),
             }
             i += 1;
@@ -151,14 +184,17 @@ impl Config {
         if c.corpus.is_none() && !c.synthetic {
             usage("give --corpus DIR, --synthetic, or both");
         }
+        if !c.merge.is_empty() && c.corpus.is_none() {
+            usage("--merge needs --corpus");
+        }
         c
     }
 }
 
 fn usage(problem: &str) -> ! {
     eprintln!(
-        "stateless_diff: {problem}\nusage: stateless_diff [--corpus DIR] [--synthetic] [--prefixes all|N] \
-         [--threads K] [--latency-trajectories N] [--durable-dir DIR] [--report FILE]"
+        "stateless_diff: {problem}\nusage: stateless_diff [--corpus DIR] [--synthetic] [--merge K,…] \
+         [--prefixes all|N] [--threads K] [--latency-trajectories N] [--durable-dir DIR] [--report FILE]"
     );
     std::process::exit(2)
 }
@@ -194,6 +230,7 @@ fn load_corpus(dir: &Path, bundles: &mut Vec<Bundle>, out: &mut Vec<Trajectory>)
             source: m["source"].as_str().expect("source").to_string(),
             bundle,
             events: history.iter().map(|t| to_event(&t.event, t.ts)).collect(),
+            members: Vec::new(),
         });
     }
 }
@@ -269,6 +306,7 @@ fn add_synthetic(bundles: &mut Vec<Bundle>, out: &mut Vec<Trajectory>) {
                     source: source.clone(),
                     bundle,
                     events: workload_history(n),
+                    members: Vec::new(),
                 });
             }
             out.push(Trajectory {
@@ -276,12 +314,90 @@ fn add_synthetic(bundles: &mut Vec<Bundle>, out: &mut Vec<Trajectory>) {
                 source: source.clone(),
                 bundle,
                 events: mixed_history(300, policies as u64 * 31 + pinning.label().len() as u64),
+                members: Vec::new(),
             });
         }
     }
     // The global, unpinned schema with the default name, so the corpus and the
     // synthetic runs both cover a store with no pins at all.
     debug_assert_eq!(Pinning::Unpinned.event_schema(), UNPINNED_EVENT_SCHEMA);
+}
+
+/// Interleave several trajectories of one policy set into one history, as if
+/// their conversations ran at the same time: member `j` is shifted to start at
+/// `T0 + j µs` (keeping all of its own gaps), the events are merged by time, and
+/// each gets the timestamp the durable engine's clamp would give it
+/// (`max(ts, previous + 1)`). Members keep their events at those timestamps, so a
+/// member replayed alone sees exactly the times it saw in the merged history.
+fn merge_group(source: &str, k: usize, n: usize, chunk: &[&Trajectory]) -> Trajectory {
+    let mut order: Vec<(i64, usize, usize)> = Vec::new();
+    for (j, t) in chunk.iter().enumerate() {
+        let base = t.events[0].timestamp();
+        for (i, e) in t.events.iter().enumerate() {
+            order.push((T0 + (e.timestamp() - base) + j as i64 * 1_000, j, i));
+        }
+    }
+    order.sort_unstable();
+    let mut events = Vec::with_capacity(order.len());
+    let mut members: Vec<Member> = chunk
+        .iter()
+        .map(|t| Member {
+            id: t.id.clone(),
+            indices: Vec::new(),
+        })
+        .collect();
+    let mut previous: Option<i64> = None;
+    for (position, (ts, j, i)) in order.into_iter().enumerate() {
+        let effective = match previous {
+            Some(p) if ts <= p => p + 1,
+            _ => ts,
+        };
+        previous = Some(effective);
+        events.push(
+            chunk[j].events[i]
+                .clone()
+                .into_builder()
+                .timestamp(effective)
+                .build(),
+        );
+        members[j].indices.push(position);
+    }
+    Trajectory {
+        id: format!("merge{k}-{n:03}"),
+        source: format!("{source}×{k}"),
+        bundle: chunk[0].bundle,
+        events,
+        members,
+    }
+}
+
+/// For each group size `k`, merged trajectories made of `k` consecutive corpus
+/// trajectories that share a source and a policy set.
+fn add_merged(sizes: &[usize], out: &mut Vec<Trajectory>) {
+    let mut groups: Vec<((String, usize), Vec<usize>)> = Vec::new();
+    for (i, t) in out.iter().enumerate() {
+        if t.events.is_empty() {
+            continue;
+        }
+        let key = (t.source.clone(), t.bundle);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => members.push(i),
+            None => groups.push((key, vec![i])),
+        }
+    }
+    let mut merged = Vec::new();
+    for &k in sizes {
+        let mut counters: HashMap<String, usize> = HashMap::new();
+        for ((source, _), members) in &groups {
+            for chunk in members.chunks(k).filter(|c| c.len() >= 2) {
+                let n = counters.entry(source.clone()).or_insert(0);
+                let refs: Vec<&Trajectory> = chunk.iter().map(|&i| &out[i]).collect();
+                merged.push(merge_group(source, k, *n, &refs));
+                *n += 1;
+            }
+        }
+    }
+    out.extend(merged);
 }
 
 // ─── Running the two engines ─────────────────────────────────────────
@@ -449,6 +565,90 @@ struct DiffResult {
     decisions: usize,
     rejected: bool,
     mismatches: Vec<Value>,
+    /// Merged trajectories: events whose merged outcome was compared with the
+    /// same event's outcome in its member replayed alone, and how many differed.
+    isolation_compared: usize,
+    isolation_mismatches: usize,
+    /// Merged trajectories whose members share a principal (isolation not checked).
+    shared_principal: bool,
+}
+
+fn positions_of(engine: &DurableTemporalEngine) -> HashMap<String, usize> {
+    engine
+        .list()
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.token.to_string(), i))
+        .collect()
+}
+
+/// `None` when two durable outcomes agree (each read with its own engine's tokens).
+fn same_outcome(
+    a: &Result<Submitted, DurableError>,
+    a_positions: &HashMap<String, usize>,
+    b: &Result<Submitted, DurableError>,
+    b_positions: &HashMap<String, usize>,
+) -> Option<String> {
+    match (a, b) {
+        (Ok(a), Ok(b)) => {
+            let (va, vb) = (
+                durable_verdict(a, a_positions),
+                durable_verdict(b, b_positions),
+            );
+            (va != vb).then(|| format!("merged {va:?} vs alone {vb:?}"))
+        }
+        (Err(a), Err(b)) if a.to_string() == b.to_string() => None,
+        (a, b) => Some(format!(
+            "merged {:?} vs alone {:?}",
+            a.as_ref().map(|s| durable_verdict(s, a_positions)),
+            b.as_ref().map(|s| durable_verdict(s, b_positions))
+        )),
+    }
+}
+
+/// The isolation check for a merged trajectory: every member, replayed alone
+/// through a fresh durable engine at the timestamps it had in the merged
+/// history, must reach exactly the outcomes its events reached in the merged
+/// run. Under a principal pin, other members' events are invisible to it.
+fn isolation(
+    t: &Trajectory,
+    bundle: &Bundle,
+    merged: &[Result<Submitted, DurableError>],
+    merged_positions: &HashMap<String, usize>,
+    r: &mut DiffResult,
+) {
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    for (j, m) in t.members.iter().enumerate() {
+        for &i in &m.indices {
+            if let Some(p) = t.events[i].principal()
+                && *owner.entry(p).or_insert(j) != j
+            {
+                r.shared_principal = true;
+                return;
+            }
+        }
+    }
+    for m in &t.members {
+        let first = t.events[m.indices[0]].timestamp();
+        let Ok((mut alone, clock, _)) = durable(bundle, first, None, &m.id) else {
+            continue; // a set install rejects; the merged run reported it
+        };
+        let alone_positions = positions_of(&alone);
+        for &i in &m.indices {
+            let event = &t.events[i];
+            clock.0.store(event.timestamp(), Ordering::SeqCst);
+            let out = alone.submit(event.clone().into_builder());
+            r.isolation_compared += 1;
+            if let Some(what) = same_outcome(&merged[i], merged_positions, &out, &alone_positions) {
+                r.isolation_mismatches += 1;
+                r.mismatches.push(
+                    json!({"trajectory": t.id, "source": t.source, "bundle": bundle.name,
+                    "member": m.id, "index": i, "what": format!("isolation: {what}"),
+                    "event": format!("{event:?}")}),
+                );
+            }
+        }
+    }
 }
 
 fn diff(
@@ -508,12 +708,10 @@ fn diff(
             durable_engine.submit(e.clone().into_builder())
         })
         .collect();
-    let positions: HashMap<String, usize> = durable_engine
-        .list()
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.token.to_string(), i))
-        .collect();
+    let positions = positions_of(&durable_engine);
+    if !t.members.is_empty() {
+        isolation(t, bundle, &outcomes, &positions, &mut r);
+    }
     for i in select(t.events.len(), sample) {
         let decided = stateless.decide_last(&t.events[..=i]);
         r.compared += 1;
@@ -701,13 +899,24 @@ fn latency_json(l: &Latency) -> Value {
 fn markdown(sources: &[(String, Value)]) {
     println!("\n## Differential\n");
     println!(
-        "| Source | Trajectories | Events | Prefixes compared | Decisions | Mismatches | Rejected (both) |"
+        "| Source | Trajectories | Events | Prefixes compared | Decisions | Mismatches | Rejected (both) | Isolation: events compared / violations |"
     );
-    println!("|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|");
     for (name, s) in sources {
         let d = &s["diff"];
+        let compared = d["isolation_compared"].as_u64().unwrap_or(0);
+        let shared = d["shared_principal_groups"].as_u64().unwrap_or(0);
+        let isolation = match (compared, shared) {
+            (0, 0) => "n/a".to_string(),
+            (0, s) => format!("not checked: {s} group(s) share a principal"),
+            (c, 0) => format!("{c} / {}", d["isolation_mismatches"]),
+            (c, s) => format!(
+                "{c} / {} ({s} group(s) share a principal, not checked)",
+                d["isolation_mismatches"]
+            ),
+        };
         println!(
-            "| {name} | {} | {} | {} | {} | {} | {} |",
+            "| {name} | {} | {} | {} | {} | {} | {} | {isolation} |",
             d["trajectories"],
             d["events"],
             d["prefixes_compared"],
@@ -748,15 +957,23 @@ fn markdown(sources: &[(String, Value)]) {
             "n/a".to_string()
         };
         let live = &l["live_every_decision"];
+        // Only trajectories whose every decision was timed (not sampled) count.
+        let live = if live["trajectories"].as_u64().unwrap_or(0) > 0 {
+            format!(
+                "{:.2} ms / {:.2} ms",
+                live["stateful_total_ms_p50"].as_f64().unwrap_or(0.0),
+                live["stateless_total_ms_p50"].as_f64().unwrap_or(0.0)
+            )
+        } else {
+            "n/a (sampled)".to_string()
+        };
         println!(
-            "| {name} | {} | {} | {} / {} | {disk} | {} | {:.2} ms / {:.2} ms |",
+            "| {name} | {} | {} | {} / {} | {disk} | {} | {live} |",
             l["trajectories"],
             f(&l["compile"]["p50_us"]),
             f(&l["durable_submit_decision"]["p50_us"]),
             f(&l["durable_submit_decision"]["p99_us"]),
             buckets.join(", "),
-            live["stateful_total_ms_p50"].as_f64().unwrap_or(0.0),
-            live["stateless_total_ms_p50"].as_f64().unwrap_or(0.0),
         );
     }
 }
@@ -767,6 +984,7 @@ fn main() {
     let mut trajectories = Vec::new();
     if let Some(dir) = &cfg.corpus {
         load_corpus(dir, &mut bundles, &mut trajectories);
+        add_merged(&cfg.merge, &mut trajectories);
     }
     if cfg.synthetic {
         add_synthetic(&mut bundles, &mut trajectories);
@@ -825,6 +1043,9 @@ fn main() {
             "decisions": rs.iter().map(|r| r.decisions).sum::<usize>(),
             "rejected_trajectories": rs.iter().filter(|r| r.rejected).count(),
             "mismatches": mismatches.len(),
+            "isolation_compared": rs.iter().map(|r| r.isolation_compared).sum::<usize>(),
+            "isolation_mismatches": rs.iter().map(|r| r.isolation_mismatches).sum::<usize>(),
+            "shared_principal_groups": rs.iter().filter(|r| r.shared_principal).count(),
         });
         all_mismatches.extend(mismatches);
 

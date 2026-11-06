@@ -31,7 +31,9 @@ clock, and keep nothing afterwards.
   in-process with no server. The history is JSON Lines of `{"ts", "event"}` or a
   JSON array; `--json` and `--timings` are available; exit codes match `submit`.
 - **performance**: the `stateless_decide` benchmark and the `stateless_diff`
-  differential and latency harness.
+  differential and latency harness. `--merge K,…` interleaves corpus
+  trajectories into multi-session histories and checks each member's outcomes
+  are the ones it has alone (isolation under the principal pin).
 
 ---
 
