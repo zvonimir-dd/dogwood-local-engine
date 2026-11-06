@@ -206,6 +206,15 @@ impl StatelessTemporalEngine {
         self.engine.with(|e| e.shard_count()).unwrap_or(0)
     }
 
+    /// Discard the last call's temporal state now rather than at the start of
+    /// the next call, which is where [`decide_last`](Self::decide_last) would
+    /// otherwise do it. Calling this after a decision moves that work (and the
+    /// freeing of its memory) to a time of the caller's choosing, such as after
+    /// a reply has been sent. It changes no decision.
+    pub fn clear(&mut self) -> Result<(), DurableError> {
+        self.reset()
+    }
+
     /// Return the temporal engine to its just-compiled, empty state.
     fn reset(&mut self) -> Result<(), DurableError> {
         if !self.dirty {
@@ -353,6 +362,18 @@ when temporal { formerly within 1h Action::"Read"::response{} };
             assert_eq!(e.temporal_shard_count(), 0, "{event_schema:?}");
             assert!(!e.dirty);
         }
+    }
+
+    #[test]
+    fn clear_empties_the_engine_and_changes_no_decision() {
+        let mut e = StatelessTemporalEngine::new(POLICY, SCHEMA, None, None).unwrap();
+        let compiled = snapshot(&e);
+        let first = e.decide_last(&history()).unwrap();
+        e.clear().unwrap();
+        assert_eq!(snapshot(&e), compiled, "cleared to the compiled state");
+        assert!(!e.dirty, "the next call has nothing to reset");
+        e.clear().unwrap(); // clearing an empty engine is a no-op
+        assert_eq!(e.decide_last(&history()).unwrap(), first);
     }
 
     #[test]
