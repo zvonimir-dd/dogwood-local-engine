@@ -32,7 +32,23 @@ cargo bench -p dogwood-performance --bench snapshot_restore -- \
 # Open-loop concurrency: offer a fixed rate, report the latency distribution.
 cargo run --release -p dogwood-performance --bin load -- \
     --policies 10,100,1000 --rates 1,10,100,500 --seconds 5 --clients 16
+
+# Stateless decisions: decide_last vs the durable engine's marginal submit and a
+# full durable replay, across history length and pinning; compile cost.
+cargo bench -p dogwood-performance --bench stateless_decide
+
+# Stateless decisions at scale: decide_last against the durable engine on every
+# (or a sample of every) prefix of a trajectory corpus and of synthetic
+# histories, then a single-threaded latency pass. Exits non-zero on any mismatch.
+cargo run --release -p dogwood-performance --bin stateless_diff -- \
+    --corpus DIR --synthetic [--prefixes all|N] [--threads K] [--durable-dir DIR]
 ```
+
+`stateless_diff`'s corpus is a directory of `manifest.jsonl` (one `{"id",
+"source", "bundle", "path"}` per trajectory), `bundles/<name>/{policy.dw,
+action.cedarschema[, event.dwschema]}`, and one history per trajectory in
+`dogwood-server decide-last`'s `--events` format (JSON Lines of `{"ts": <epoch
+ns>, "event": <wire event>}`).
 
 The load harness scales its client count down to the offered rate, so low rates are
 honest: at 1 rps it uses one client, because a fixed pool of 16 would each have to

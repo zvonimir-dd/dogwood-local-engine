@@ -388,11 +388,14 @@ impl PolicySet {
     }
 
     /// Build a fresh set from canonical statements with **placeholder** handles,
-    /// minting ordinals from 0. For building a *reference-only* carrier (tests,
-    /// oracle) that never enters the engine — the handles are deterministic
-    /// stand-ins, not the opaque tokens a real install mints. The engine's own
-    /// install path uses [`from_statements_after`](Self::from_statements_after)
-    /// with a real token generator.
+    /// minting ordinals from 0. For a carrier that never enters a durable store:
+    /// a reference (tests, oracle) or a
+    /// [`StatelessTemporalEngine`](crate::StatelessTemporalEngine), whose
+    /// decisions report these handles. They are deterministic stand-ins
+    /// (`SPref0`, `SPref1`, …), not the opaque tokens a real install mints, and
+    /// cannot collide with them. The engine's own install path uses
+    /// [`from_statements_after`](Self::from_statements_after) with a real token
+    /// generator.
     pub fn from_statements<I: IntoIterator<Item = String>>(statements: I, now: i64) -> Self {
         let mut n: u64 = 0;
         Self::from_statements_after(statements, now, 0, || {

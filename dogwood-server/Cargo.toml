@@ -58,6 +58,12 @@ path = "tests/protocol.rs"
 name = "server_e2e"
 path = "tests/server_e2e.rs"
 
+# The in-process `decide-last` command through the real binary: its output and
+# exit codes, with no server started.
+[[test]]
+name = "decide_last_cli"
+path = "tests/decide_last_cli.rs"
+
 # Pin-sharded partitioning: that a partition key is derived when — and only when —
 # the schema makes partitioning sound, and that routing groups exactly the events a
 # policy must correlate.

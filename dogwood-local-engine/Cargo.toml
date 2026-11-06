@@ -61,6 +61,18 @@ dogwood-language = { git = "https://github.com/dogwood-policy/dogwood", rev = "4
 name = "corpus_diff"
 path = "tests/corpus_diff.rs"
 
+# Stateless decisions: for every prefix of scripted histories, decide_last equals
+# what submit returned on a fresh durable engine (pinned, unpinned, aggregate).
+[[test]]
+name = "stateless"
+path = "tests/stateless.rs"
+
+# The stateless engine against the interpreter oracle on every prefix of every
+# passing corpus trace.
+[[test]]
+name = "stateless_corpus_diff"
+path = "tests/stateless_corpus_diff.rs"
+
 
 # Proves the incremental non-correlated-`formerly` path is actually built
 # (incremental_leaf_count >= 1) and agrees with the in-memory oracle.

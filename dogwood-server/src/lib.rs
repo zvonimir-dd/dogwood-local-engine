@@ -24,6 +24,8 @@
 //!   — the mechanism the whole boundary rests on.
 //! - [`codec`] — the event wire/log format.
 //! - [`client`] — reference clients for both sockets.
+//! - [`history`] — timestamped event histories read from a file, for the
+//!   in-process `decide-last` command (never sent over a socket).
 //!
 //! # The deployment prerequisite
 //!
@@ -41,6 +43,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod history;
 pub mod peer;
 pub mod protocol;
 pub mod routing;

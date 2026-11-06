@@ -11,6 +11,12 @@
 //! everything durability-related lives here, so an embedder gets the whole
 //! machine, not just the parts.
 //!
+//! Compiling a policy set (lowering, validation, pin partitioning and
+//! attribution, then preparing an empty monitor) is one private step, `compile`,
+//! shared by `rebuild` and by [`StatelessTemporalEngine`], which decides the last
+//! event of a supplied history with no log or clock. Sharing it is what makes a
+//! stateless decision the same as `submit`'s rather than a lookalike.
+//!
 //! # Why one caller-held mutex over the whole thing
 //!
 //! The concurrency model is **single-writer per monitor
@@ -45,9 +51,11 @@ use crate::shared::SharedEngine;
 use crate::{DurableLog, LeafStateTransferError, LocalTemporalEngine, Snapshot, TickRate, Write};
 
 mod attribution;
+mod stateless;
 
 pub use attribution::{DecisionDiagnostics, DecisionResponse, PolicyAttribution};
 use attribution::{RuleAttribution, attribute_response, build_attributions};
+pub use stateless::{Decided, StatelessTemporalEngine, decide_last};
 
 /// Metadata slot recording the unit this store's timestamps were assigned in.
 const META_TIME_UNIT: &str = "dogwood_server_time_unit";
@@ -1925,7 +1933,7 @@ impl DurableTemporalEngine {
 /// metadata, the status counts, and how to prepare that engine again.
 ///
 /// Shared by `DurableTemporalEngine::rebuild`, which then loads state from a
-/// snapshot or a transplant, and by the stateless engine, which returns
+/// snapshot or a transplant, and by [`StatelessTemporalEngine`], which returns
 /// the engine to this empty state before every decision. Both therefore lower,
 /// validate, partition and attribute a policy set identically.
 struct Compiled {
@@ -1962,7 +1970,6 @@ impl Preparation {
     /// Return a compiled set's engine to the empty state `compile` left it in.
     /// `prepare` keeps the partition keys (which may only be set once), so they
     /// are not set again.
-    #[allow(dead_code)] // used by the stateless engine
     fn reset(&self, engine: &mut LocalTemporalEngine) -> Result<(), DurableError> {
         self.prepare_leaves(engine)?;
         engine.set_policy_ids(&self.policy_ids);
@@ -2060,7 +2067,6 @@ fn compile(installed: &Installed, service: &ServiceSchema) -> Result<Compiled, D
         partition_key,
         preparation,
     })
-
 }
 
 /// Wrap a prepared engine for sharing and build the authorizer over it. The

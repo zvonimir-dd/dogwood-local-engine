@@ -4,6 +4,37 @@ Release notes for the Dogwood local authorization engine
 (`dogwood-local-engine`, `dogwood-server`, `dogwood-performance`).
 
 
+## [Unreleased]
+
+### Summary
+
+Stateless decisions: given a whole event history, decide its last event with
+the verdict a fresh store's `submit` would give, without a store, a log or a
+clock, and keep nothing afterwards.
+
+### Compatibility
+
+- `install`, `submit` and recovery are unchanged. The compile step they use
+  moved into a private function that the stateless engine shares; its error
+  order and messages are the same.
+- Same `dogwood-language` revision. The additions are new API only.
+
+### Added
+
+- **engine**: `StatelessTemporalEngine` (`new`, `decide_last`, `status`,
+  `list`), `Decided`, and the one-shot `decide_last`. A policy set compiles
+  exactly when `install` would accept it, with the same message when it does not.
+  History timestamps are epoch nanoseconds; ties are spread like `submit`'s
+  clamp; a decreasing timestamp or a history ending in a non-decision event is a
+  `BadEvent`. Attribution tokens are placeholders (`SPref<n>`).
+- **server**: `dogwood-server decide-last POLICY --action-schema F --events F|-`,
+  in-process with no server. The history is JSON Lines of `{"ts", "event"}` or a
+  JSON array; `--json` and `--timings` are available; exit codes match `submit`.
+- **performance**: the `stateless_decide` benchmark and the `stateless_diff`
+  differential and latency harness.
+
+---
+
 ## [1.1.0] — 2026-10-09
 
 ### Summary

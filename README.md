@@ -44,6 +44,12 @@ which edit the policy set that the engine is monitoring. The other is used for
 *data plane* operations: incoming history and decision events. The engine
 records all these events and issues verdicts for decision events.
 
+When the history already exists elsewhere, the library's
+`StatelessTemporalEngine` decides the last event of a supplied history, with the
+same verdict a fresh store's `submit` would give and nothing kept afterwards.
+`dogwood-server decide-last` does the same from the command line, with no server
+running.
+
 ## Embedding the engine safely
 
 There are a few important precautions to keep in mind when constructing an

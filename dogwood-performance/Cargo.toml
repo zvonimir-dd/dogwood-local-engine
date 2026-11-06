@@ -79,6 +79,14 @@ name = "snapshot_restore"
 path = "benches/snapshot_restore.rs"
 harness = false
 
+# Stateless decisions (`StatelessTemporalEngine::decide_last`) against the
+# durable engine's marginal submit and a full durable replay, across history
+# length and pinning, plus compile cost by policy count. In-memory logs, no fsync.
+[[bench]]
+name = "stateless_decide"
+path = "benches/stateless_decide.rs"
+harness = false
+
 # Durable-record JSON encode/decode cost. Compares the original serde-derived
 # implementation with the explicit implementation used by the Verus proof.
 [[bench]]

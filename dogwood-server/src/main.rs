@@ -11,9 +11,17 @@
 //!   over the agent's data path.
 //! - `dogwood-server submit` / `ping` — data-path clients, for driving a running
 //!   server by hand.
+//! - `dogwood-server decide-last` — no server at all: decide the last event of a
+//!   history file in-process, statelessly.
 //!
 //! The file-only commands (`dogwood validate`, `lower`, `replay`) stay in
-//! `dogwood-cli`: those operate on files, not on a live server.
+//! `dogwood-cli`: those operate on files, not on a live server. `decide-last` is
+//! the exception because it answers with *this* engine's semantics (install's
+//! validation, the nanosecond clock and its tie clamp, pin partitioning), through
+//! [`StatelessTemporalEngine`](dogwood_local_engine::StatelessTemporalEngine):
+//! its decision is exactly what a fresh server's `submit` would return for that
+//! event, which the reference interpreter behind `dogwood replay` does not
+//! promise.
 //!
 //! # What this adds over embedding the library
 //!
@@ -25,11 +33,17 @@
 //! uid and the monitored agent as a different, lower-privileged uid.** Same uid,
 //! no boundary.
 
+use std::io::Read;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
+use dogwood_language::Event;
+use dogwood_local_engine::{Decided, PolicyAttribution, StatelessTemporalEngine};
 use dogwood_server::client::{ControlClient, DataClient};
+use dogwood_server::codec::to_event;
+use dogwood_server::history::parse_history;
 use dogwood_server::peer::ControlAllowlist;
 use dogwood_server::protocol::{
     ControlRequest, ControlResponse, DataRequest, DataResponse, WireEvent, WireVerb,
@@ -110,6 +124,35 @@ enum Command {
 
     /// Data plane: check that the server is alive.
     Ping,
+
+    /// Decide the last event of a history file, statelessly and in-process.
+    ///
+    /// No server, no store and nothing kept: the policy set is compiled as
+    /// `policy install` would, the events before the last one are replayed into
+    /// a fresh monitor without being decided, and the last one is decided. The
+    /// verdict is what a fresh server's `submit` would return for it. Exits
+    /// non-zero on a deny, like `submit`.
+    DecideLast {
+        /// The `.dw` policy file.
+        policy: PathBuf,
+        /// The Cedar action schema (`.cedarschema`).
+        #[arg(long)]
+        action_schema: PathBuf,
+        /// The event-schema DSL (`.dwschema`). Omit to use the default schema.
+        #[arg(long)]
+        event_schema: Option<PathBuf>,
+        /// A Dogwood macro library. Omit to use the built-in macros.
+        #[arg(long)]
+        macros: Option<PathBuf>,
+        /// The history, in time order and ending with a decision event: JSON
+        /// Lines of `{"ts": <epoch ns>, "event": <submit's event object>}`, or a
+        /// JSON array of them. `-` reads standard input.
+        #[arg(long)]
+        events: PathBuf,
+        /// Also report how long compiling and deciding took.
+        #[arg(long)]
+        timings: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -422,6 +465,128 @@ fn run(cli: &Cli, paths: &Paths) -> Result<(), String> {
             let response = client.call(&DataRequest::Ping)?;
             report_data(cli, &response)
         }
+
+        Command::DecideLast {
+            policy,
+            action_schema,
+            event_schema,
+            macros,
+            events,
+            timings,
+        } => {
+            let policy = read(policy)?;
+            let action_schema = read(action_schema)?;
+            let event_schema = event_schema.as_ref().map(read).transpose()?;
+            let macros = macros.as_ref().map(read).transpose()?;
+            let source = if events.as_os_str() == "-" {
+                let mut s = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut s)
+                    .map_err(|e| format!("read standard input: {e}"))?;
+                s
+            } else {
+                read(events)?
+            };
+            let history: Vec<Event> = parse_history(&source)?
+                .iter()
+                .map(|t| to_event(&t.event, t.ts))
+                .collect();
+
+            let started = Instant::now();
+            let mut engine = StatelessTemporalEngine::new(
+                &policy,
+                &action_schema,
+                event_schema.as_deref(),
+                macros.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
+            let compiled = started.elapsed();
+            let decided = engine.decide_last(&history).map_err(|e| e.to_string())?;
+            let total = started.elapsed();
+            let timings = timings.then_some(Timings {
+                compile: compiled,
+                decide: total - compiled,
+            });
+            report_decided(cli, &decided, history.len(), timings)
+        }
+    }
+}
+
+/// How long `decide-last` spent compiling the policy set and deciding.
+struct Timings {
+    compile: Duration,
+    decide: Duration,
+}
+
+/// Print a stateless decision, exiting non-zero on a deny as `submit` does.
+/// Determining policies are listed by `@id` (their token when they have none),
+/// sorted, so the output is stable.
+fn report_decided(
+    cli: &Cli,
+    decided: &Decided,
+    events: usize,
+    timings: Option<Timings>,
+) -> Result<(), String> {
+    let response = &decided.response;
+    let allowed = response.allowed();
+    let mut reasons: Vec<&PolicyAttribution> = response.diagnostics().reason().collect();
+    let name = |r: &PolicyAttribution| {
+        r.annotation_id()
+            .map(String::from)
+            .unwrap_or_else(|| r.token.to_string())
+    };
+    reasons.sort_by_key(|r| (name(r), r.token.to_string()));
+    let errors: Vec<&str> = response.diagnostics().errors().collect();
+
+    if cli.json {
+        let mut out = serde_json::json!({
+            "status": "decision",
+            "allowed": allowed,
+            "decided_at_nanos": decided.ts,
+            "events": events,
+            "reason": reasons,
+            "errors": errors,
+        });
+        if let Some(t) = &timings {
+            let total = t.compile + t.decide;
+            out["timings_us"] = serde_json::json!({
+                "compile": t.compile.as_micros() as u64,
+                "decide": t.decide.as_micros() as u64,
+                "total": total.as_micros() as u64,
+            });
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("{}", if allowed { "ALLOW" } else { "DENY" });
+        println!(
+            "  decided at: {}ns (event {events} of {events})",
+            decided.ts
+        );
+        for r in &reasons {
+            match r.description() {
+                Some(d) => println!("  determined by: {}: {d}", name(r)),
+                None => println!("  determined by: {}", name(r)),
+            }
+        }
+        for e in &errors {
+            println!("  error: {e}");
+        }
+        if let Some(t) = &timings {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            println!(
+                "  compiled in {:.3} ms, decided in {:.3} ms",
+                ms(t.compile),
+                ms(t.decide)
+            );
+        }
+    }
+    if allowed {
+        Ok(())
+    } else {
+        Err("deny".to_string())
     }
 }
 
