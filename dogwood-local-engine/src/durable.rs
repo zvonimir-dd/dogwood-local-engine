@@ -27,9 +27,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use dogwood_language::cedar::Schema;
 use dogwood_language::{
-    Authorizer, DogwoodRuleRef, EventBuilder, ParsedPolicySet, PolicySchema, ServiceSchema,
-    TemporalEngine, Validator,
+    Authorizer, DogwoodRuleRef, Event, EventBuilder, EventSignature, LoweredPolicySet,
+    ParsedPolicySet, PolicySchema, ServiceSchema, TemporalEngine, TemporalField, Validator,
 };
 
 use crate::clock::{Clock, WallClock};
@@ -1226,20 +1227,7 @@ impl DurableTemporalEngine {
             // A kind the schema calls a decision point that nonetheless produced
             // no response means the authorizer disagreed with our kind lookup —
             // report it rather than inventing a verdict either way.
-            (true, None) => {
-                // The fully-qualified action (`Ns::Action::id`), not the bare id,
-                // so the message names what the operator would search for.
-                let action = if event.namespace().is_empty() {
-                    event.action().to_string()
-                } else {
-                    format!("{}::{}", event.namespace().join("::"), event.action())
-                };
-                return Err(DurableError::BadEvent(format!(
-                    "event kind `{}` is a decision kind but yielded no decision \
-                     (is `{action}` declared in the schema?)",
-                    event.kind(),
-                )));
-            }
+            (true, None) => return Err(decision_without_response(&event)),
             (false, _) => Submitted {
                 offset,
                 ts,
@@ -1731,71 +1719,19 @@ impl DurableTemporalEngine {
         // The service schema (event schema + macros) is store config, held on
         // `self`, not carried in the bundle.
         let service = Self::build_service(&self.service_config)?;
-        let policy_schema = PolicySchema::from_cedarschema_str(&installed.action_schema)
-            .map_err(|e| DurableError::Rejected(format!("action schema: {e}")))?;
-        let policy_src = installed.combined_source();
-        let parsed = ParsedPolicySet::parse(&policy_src, &service)
-            .map_err(|e| DurableError::Rejected(format!("policy: {e}")))?;
-        let policy_ids = validate_policy_entry_alignment(installed, &service, &parsed)?;
-        let lowered = parsed
-            .lower(&policy_schema)
-            .map_err(|e| DurableError::Rejected(format!("policy: {e}")))?;
-        validate_lowered_rule_alignment(lowered.rules(), policy_ids.len())?;
-
-        let result = Validator::new().validate(&lowered);
-        if !result.validation_passed() {
-            let findings: Vec<String> = result.validation_errors().map(|e| e.to_string()).collect();
-            return Err(DurableError::Rejected(format!(
-                "policy set failed validation:\n{}",
-                findings.join("\n")
-            )));
-        }
-
-        let attributions =
-            build_attributions(lowered.rules(), lowered.as_cedar(), &installed.policies)?;
-        let rule_count = lowered.rules().count();
-        // NATIVE PIN PARTITIONING, auto-enabled by the schema's pins:
-        // with universal
-        // symmetric pins declared, the engine runs one monitor shard
-        // per pin value over the NON-relativized leaves — same verdicts
-        // as the relativization rewrite, flat
-        // per-key evaluation, and stale-key reclamation. Without pins
-        // the two leaf sets coincide and the engine runs global.
-        let partitioned = !lowered.partition_keys().is_empty();
-        let leaves: Vec<_> = if partitioned {
-            lowered.nonrelativized_temporal_fields().cloned().collect()
-        } else {
-            lowered.temporal_fields().cloned().collect()
-        };
-        let leaf_count = leaves.len();
-        let decision_kinds: Vec<String> = lowered.decision_kinds().map(String::from).collect();
-        let schema = lowered.cedar_schema().clone();
-        // Whether this schema's event stream may be partitioned.
-        // Derived from the schema's declared pins, so it changes with the
-        // policy set — a schema edit that drops the universal pin makes the stream
-        // unshardable from that apply forward.
-        let shard_plan = ShardPlan::from_policies(&lowered);
-
-        // The declared signature of every event the policy set can see. The
-        // local engine interprets rather than compiles, so it does not use
-        // these — but the trait requires them.
-        let event_signatures: Vec<_> = lowered.event_signatures().collect();
-
-        // Prepare a fresh engine over the new leaves, then give it state.
-        let mut engine = LocalTemporalEngine::new().with_tick_rate(TIME_UNIT);
-        if partitioned {
-            engine.set_partition_keys(lowered.partition_keys());
-        }
-        engine
-            .prepare(&leaves, &schema, &event_signatures)
-            .map_err(|e| DurableError::Rejected(format!("prepare leaves: {e}")))?;
-        let incremental_leaves = engine.incremental_leaf_count();
-        let leaf_keys = engine.leaf_keys();
-
-        // Feed the engine the validated id ↔ source-position map so
-        // `save_keyed_state` / `share_leaf_state` key by
-        // `(policy id, clause ordinal)`.
-        engine.set_policy_ids(&policy_ids);
+        let Compiled {
+            lowered,
+            mut engine,
+            attributions,
+            decision_kinds,
+            rule_count,
+            leaf_count,
+            incremental_leaves,
+            leaf_keys,
+            shard_plan,
+            partition_key,
+            preparation: _,
+        } = compile(installed, &service)?;
 
         let leaves_retained = match source {
             // The leaves are exactly the ones this snapshot was taken from — it
@@ -1827,11 +1763,7 @@ impl DurableTemporalEngine {
 
         // Share the engine so `checkpoint` can read its state; the authorizer
         // gets a clone of the handle, not a second engine.
-        let shared = SharedEngine::new(engine);
-        let authorizer = Authorizer::builder(lowered)
-            .temporal_engine(shared.clone())
-            .build()
-            .map_err(|e| DurableError::Rejected(format!("build authorizer: {e}")))?;
+        let (shared, authorizer) = assemble(engine, lowered)?;
 
         // Built, not installed. The caller decides when this starts serving —
         // `apply` makes it durable first, so a crash cannot leave decisions
@@ -1846,10 +1778,7 @@ impl DurableTemporalEngine {
             leaf_count,
             incremental_leaves,
             leaf_keys,
-            partition_key: match &shard_plan {
-                ShardPlan::Sharded { key_paths } => key_paths.iter().map(|p| p.join(".")).collect(),
-                ShardPlan::Unshardable => Vec::new(),
-            },
+            partition_key,
             shard_plan,
         };
 
@@ -1989,6 +1918,183 @@ impl DurableTemporalEngine {
             .map(|r| r.leaf_keys.clone())
             .unwrap_or_default()
     }
+}
+
+/// What a policy bundle compiles to before any state is loaded: the lowered
+/// set, an empty temporal engine prepared over its leaves, the attribution
+/// metadata, the status counts, and how to prepare that engine again.
+///
+/// Shared by `DurableTemporalEngine::rebuild`, which then loads state from a
+/// snapshot or a transplant, and by the stateless engine, which returns
+/// the engine to this empty state before every decision. Both therefore lower,
+/// validate, partition and attribute a policy set identically.
+struct Compiled {
+    lowered: LoweredPolicySet,
+    engine: LocalTemporalEngine,
+    attributions: Vec<RuleAttribution>,
+    decision_kinds: Vec<String>,
+    rule_count: usize,
+    leaf_count: usize,
+    incremental_leaves: usize,
+    leaf_keys: Vec<String>,
+    shard_plan: ShardPlan,
+    partition_key: Vec<String>,
+    preparation: Preparation,
+}
+
+/// The arguments a compiled set's temporal engine was prepared with, kept so
+/// the engine can be returned to its just-compiled, empty state.
+struct Preparation {
+    leaves: Vec<TemporalField>,
+    schema: Schema,
+    event_signatures: Vec<EventSignature>,
+    policy_ids: Vec<PolicyId>,
+}
+
+impl Preparation {
+    /// Rebuild `engine`'s monitors over the leaves, discarding all their state.
+    fn prepare_leaves(&self, engine: &mut LocalTemporalEngine) -> Result<(), DurableError> {
+        engine
+            .prepare(&self.leaves, &self.schema, &self.event_signatures)
+            .map_err(|e| DurableError::Rejected(format!("prepare leaves: {e}")))
+    }
+
+    /// Return a compiled set's engine to the empty state `compile` left it in.
+    /// `prepare` keeps the partition keys (which may only be set once), so they
+    /// are not set again.
+    #[allow(dead_code)] // used by the stateless engine
+    fn reset(&self, engine: &mut LocalTemporalEngine) -> Result<(), DurableError> {
+        self.prepare_leaves(engine)?;
+        engine.set_policy_ids(&self.policy_ids);
+        Ok(())
+    }
+}
+
+/// Lower, validate and attribute `installed` against `service`, and prepare an
+/// empty temporal engine over its leaves. See [`Compiled`].
+fn compile(installed: &Installed, service: &ServiceSchema) -> Result<Compiled, DurableError> {
+    let policy_schema = PolicySchema::from_cedarschema_str(&installed.action_schema)
+        .map_err(|e| DurableError::Rejected(format!("action schema: {e}")))?;
+    let policy_src = installed.combined_source();
+    let parsed = ParsedPolicySet::parse(&policy_src, service)
+        .map_err(|e| DurableError::Rejected(format!("policy: {e}")))?;
+    let policy_ids = validate_policy_entry_alignment(installed, service, &parsed)?;
+    let lowered = parsed
+        .lower(&policy_schema)
+        .map_err(|e| DurableError::Rejected(format!("policy: {e}")))?;
+    validate_lowered_rule_alignment(lowered.rules(), policy_ids.len())?;
+
+    let result = Validator::new().validate(&lowered);
+    if !result.validation_passed() {
+        let findings: Vec<String> = result.validation_errors().map(|e| e.to_string()).collect();
+        return Err(DurableError::Rejected(format!(
+            "policy set failed validation:\n{}",
+            findings.join("\n")
+        )));
+    }
+
+    let attributions =
+        build_attributions(lowered.rules(), lowered.as_cedar(), &installed.policies)?;
+    let rule_count = lowered.rules().count();
+    // NATIVE PIN PARTITIONING, auto-enabled by the schema's pins:
+    // with universal
+    // symmetric pins declared, the engine runs one monitor shard
+    // per pin value over the NON-relativized leaves — same verdicts
+    // as the relativization rewrite, flat
+    // per-key evaluation, and stale-key reclamation. Without pins
+    // the two leaf sets coincide and the engine runs global.
+    let partitioned = !lowered.partition_keys().is_empty();
+    let leaves: Vec<_> = if partitioned {
+        lowered.nonrelativized_temporal_fields().cloned().collect()
+    } else {
+        lowered.temporal_fields().cloned().collect()
+    };
+    let leaf_count = leaves.len();
+    let decision_kinds: Vec<String> = lowered.decision_kinds().map(String::from).collect();
+    let schema = lowered.cedar_schema().clone();
+    // Whether this schema's event stream may be partitioned.
+    // Derived from the schema's declared pins, so it changes with the
+    // policy set — a schema edit that drops the universal pin makes the stream
+    // unshardable from that apply forward.
+    let shard_plan = ShardPlan::from_policies(&lowered);
+
+    // The declared signature of every event the policy set can see. The
+    // local engine interprets rather than compiles, so it does not use
+    // these — but the trait requires them.
+    let event_signatures: Vec<_> = lowered.event_signatures().collect();
+
+    // Prepare a fresh engine over the new leaves; the caller gives it state.
+    let mut engine = LocalTemporalEngine::new().with_tick_rate(TIME_UNIT);
+    if partitioned {
+        engine.set_partition_keys(lowered.partition_keys());
+    }
+    let preparation = Preparation {
+        leaves,
+        schema,
+        event_signatures,
+        policy_ids,
+    };
+    preparation.prepare_leaves(&mut engine)?;
+    let incremental_leaves = engine.incremental_leaf_count();
+    let leaf_keys = engine.leaf_keys();
+
+    // Feed the engine the validated id ↔ source-position map so
+    // `save_keyed_state` / `share_leaf_state` key by
+    // `(policy id, clause ordinal)`.
+    engine.set_policy_ids(&preparation.policy_ids);
+    let partition_key = match &shard_plan {
+        ShardPlan::Sharded { key_paths } => key_paths.iter().map(|p| p.join(".")).collect(),
+        ShardPlan::Unshardable => Vec::new(),
+    };
+
+    Ok(Compiled {
+        lowered,
+        engine,
+        attributions,
+        decision_kinds,
+        rule_count,
+        leaf_count,
+        incremental_leaves,
+        leaf_keys,
+        shard_plan,
+        partition_key,
+        preparation,
+    })
+
+}
+
+/// Wrap a prepared engine for sharing and build the authorizer over it. The
+/// authorizer gets a clone of the handle, not a second engine, so the holder
+/// can still read the engine's state (checkpoints) or reset it (stateless
+/// decisions).
+fn assemble(
+    engine: LocalTemporalEngine,
+    lowered: LoweredPolicySet,
+) -> Result<(SharedEngine, Authorizer), DurableError> {
+    let shared = SharedEngine::new(engine);
+    let authorizer = Authorizer::builder(lowered)
+        .temporal_engine(shared.clone())
+        .build()
+        .map_err(|e| DurableError::Rejected(format!("build authorizer: {e}")))?;
+    Ok((shared, authorizer))
+}
+
+/// A kind the schema calls a decision point that nonetheless produced no
+/// response means the authorizer disagreed with the kind lookup: report it
+/// rather than invent a verdict either way.
+fn decision_without_response(event: &Event) -> DurableError {
+    // The fully-qualified action (`Ns::Action::id`), not the bare id,
+    // so the message names what the operator would search for.
+    let action = if event.namespace().is_empty() {
+        event.action().to_string()
+    } else {
+        format!("{}::{}", event.namespace().join("::"), event.action())
+    };
+    DurableError::BadEvent(format!(
+        "event kind `{}` is a decision kind but yielded no decision \
+         (is `{action}` declared in the schema?)",
+        event.kind(),
+    ))
 }
 
 /// Validate the correspondence between structured entries and the combined
