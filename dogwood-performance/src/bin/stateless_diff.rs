@@ -50,12 +50,22 @@
 //! principal pin, the members' events must be invisible to each other. Groups
 //! whose members share a principal are counted and not checked for isolation.
 //!
+//! # The history cache
+//!
+//! `--history-cache N` gives the differential pass's stateless engines a cache
+//! of `N` histories ([`StatelessTemporalEngine::with_history_cache`]). Prefixes
+//! are decided in increasing order, so nearly every call extends the history
+//! the call before it decided: the cached path is the one compared. The report
+//! counts hits and misses, and the latency pass times a cached engine beside
+//! the uncached one on the same prefixes.
+//!
 //! # Usage
 //!
 //! ```text
 //! cargo run --release -p dogwood-performance --bin stateless_diff -- \
 //!     [--corpus DIR] [--synthetic] [--merge K,…] [--prefixes all|<N>] [--threads <K>] \
-//!     [--latency-trajectories <N>] [--durable-dir <DIR>] [--report <FILE>]
+//!     [--history-cache <N>] [--latency-trajectories <N>] [--durable-dir <DIR>] \
+//!     [--report <FILE>]
 //! ```
 //!
 //! `--prefixes`: `all` compares every prefix of every trajectory; a number `N`
@@ -72,8 +82,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dogwood_language::{Event, UNPINNED_EVENT_SCHEMA};
 use dogwood_local_engine::{
-    Clock, Decided, DurableConfig, DurableError, DurableLog, DurableTemporalEngine, Outcome,
-    StatelessTemporalEngine, Submitted,
+    Clock, Decided, DurableConfig, DurableError, DurableLog, DurableTemporalEngine,
+    HistoryCacheStats, Outcome, StatelessTemporalEngine, Submitted,
 };
 use dogwood_performance::driver::to_event as gen_to_event;
 use dogwood_performance::workload::{ACTION_SCHEMA, GenEvent, Pinning, event_stream, policy_set};
@@ -120,6 +130,8 @@ struct Config {
     report: Option<PathBuf>,
     /// Group sizes for merged corpus trajectories (`--merge 2,5,10`).
     merge: Vec<usize>,
+    /// History cache capacity for the stateless engines (`--history-cache N`; 0 = off).
+    history_cache: usize,
 }
 
 impl Config {
@@ -135,6 +147,7 @@ impl Config {
             durable_dir: None,
             report: None,
             merge: Vec::new(),
+            history_cache: 0,
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -166,6 +179,11 @@ impl Config {
                         .parse()
                         .unwrap_or_else(|_| usage("--latency-trajectories <N>"))
                 }
+                "--history-cache" => {
+                    c.history_cache = value(&mut i)
+                        .parse()
+                        .unwrap_or_else(|_| usage("--history-cache <N>"))
+                }
                 "--durable-dir" => c.durable_dir = Some(PathBuf::from(value(&mut i))),
                 "--report" => c.report = Some(PathBuf::from(value(&mut i))),
                 "--merge" => {
@@ -194,7 +212,8 @@ impl Config {
 fn usage(problem: &str) -> ! {
     eprintln!(
         "stateless_diff: {problem}\nusage: stateless_diff [--corpus DIR] [--synthetic] [--merge K,…] \
-         [--prefixes all|N] [--threads K] [--latency-trajectories N] [--durable-dir DIR] [--report FILE]"
+         [--prefixes all|N] [--threads K] [--history-cache N] [--latency-trajectories N] \
+         [--durable-dir DIR] [--report FILE]"
     );
     std::process::exit(2)
 }
@@ -453,13 +472,14 @@ fn durable(
     Ok((engine, clock, path))
 }
 
-fn compile(bundle: &Bundle) -> Result<StatelessTemporalEngine, String> {
+fn compile(bundle: &Bundle, history_cache: usize) -> Result<StatelessTemporalEngine, String> {
     StatelessTemporalEngine::new(
         &bundle.policy,
         &bundle.action_schema,
         bundle.event_schema.as_deref(),
         None,
     )
+    .map(|e| e.with_history_cache(history_cache))
     .map_err(|e| e.to_string())
 }
 
@@ -571,6 +591,8 @@ struct DiffResult {
     isolation_mismatches: usize,
     /// Merged trajectories whose members share a principal (isolation not checked).
     shared_principal: bool,
+    /// What the history cache did for this trajectory's calls.
+    cache: HistoryCacheStats,
 }
 
 fn positions_of(engine: &DurableTemporalEngine) -> HashMap<String, usize> {
@@ -700,6 +722,7 @@ fn diff(
         }
     };
     let (mut durable_engine, clock, stateless) = engine;
+    let cache_before = stateless.history_cache_stats();
     let outcomes: Vec<Result<Submitted, DurableError>> = t
         .events
         .iter()
@@ -720,6 +743,15 @@ fn diff(
             mismatch(&mut r, Some(i), what);
         }
     }
+    let after = stateless.history_cache_stats();
+    r.cache = HistoryCacheStats {
+        calls: after.calls - cache_before.calls,
+        exact_hits: after.exact_hits - cache_before.exact_hits,
+        prefix_hits: after.prefix_hits - cache_before.prefix_hits,
+        misses: after.misses - cache_before.misses,
+        reused_events: after.reused_events - cache_before.reused_events,
+        replayed_events: after.replayed_events - cache_before.replayed_events,
+    };
     r
 }
 
@@ -733,8 +765,11 @@ struct Latency {
     submit_file: Vec<Duration>,
     /// (history length, call time)
     stateless: Vec<(usize, Duration)>,
-    /// (stateful: all submits, stateless: one call per decision), per trajectory
-    live_totals: Vec<(Duration, Duration)>,
+    /// The same calls on an engine with the history cache (when on).
+    stateless_cached: Vec<(usize, Duration)>,
+    /// (stateful: all submits, stateless: one call per decision, the same
+    /// with the history cache), per trajectory
+    live_totals: Vec<(Duration, Duration, Duration)>,
     trajectories: usize,
 }
 
@@ -743,9 +778,11 @@ fn measure(
     bundles: &[Bundle],
     sample: Option<usize>,
     file_dir: Option<&Path>,
+    history_cache: usize,
 ) -> Latency {
     let mut l = Latency::default();
     let mut compiled: HashMap<usize, StatelessTemporalEngine> = HashMap::new();
+    let mut cached: HashMap<usize, StatelessTemporalEngine> = HashMap::new();
     for t in trajectories {
         let bundle = &bundles[t.bundle];
         let Some(first) = t.events.first() else {
@@ -758,11 +795,17 @@ fn measure(
         l.install.push(started.elapsed());
         if let Entry::Vacant(slot) = compiled.entry(t.bundle) {
             let started = Instant::now();
-            let Ok(s) = compile(bundle) else { continue };
+            let Ok(s) = compile(bundle, 0) else { continue };
             l.compile.push(started.elapsed());
             slot.insert(s);
+            if history_cache > 0
+                && let Ok(c) = compile(bundle, history_cache)
+            {
+                cached.insert(t.bundle, c);
+            }
         }
         let stateless = compiled.get_mut(&t.bundle).expect("compiled above");
+        let mut with_cache = cached.get_mut(&t.bundle);
         l.trajectories += 1;
 
         let mut all_submits = Duration::ZERO;
@@ -814,6 +857,7 @@ fn measure(
 
         let selected: BTreeSet<usize> = select(t.events.len(), sample).into_iter().collect();
         let mut every_decision = Duration::ZERO;
+        let mut every_decision_cached = Duration::ZERO;
         let mut covered = true;
         for &i in &decisions {
             if !selected.contains(&i) {
@@ -825,9 +869,17 @@ fn measure(
             let took = started.elapsed();
             every_decision += took;
             l.stateless.push((i + 1, took));
+            if let Some(c) = with_cache.as_deref_mut() {
+                let started = Instant::now();
+                let _ = c.decide_last(&t.events[..=i]);
+                let took = started.elapsed();
+                every_decision_cached += took;
+                l.stateless_cached.push((i + 1, took));
+            }
         }
         if covered && !decisions.is_empty() {
-            l.live_totals.push((all_submits, every_decision));
+            l.live_totals
+                .push((all_submits, every_decision, every_decision_cached));
         }
     }
     l
@@ -859,11 +911,11 @@ const BUCKETS: [(usize, usize, &str); 5] = [
     (10_000, usize::MAX, "≥10k"),
 ];
 
-fn latency_json(l: &Latency) -> Value {
-    let buckets: Vec<Value> = BUCKETS
+fn by_history(calls: &[(usize, Duration)]) -> Vec<Value> {
+    BUCKETS
         .iter()
         .filter_map(|&(lo, hi, label)| {
-            let calls: Vec<(usize, Duration)> = l.stateless.iter().copied().filter(|(n, _)| *n >= lo && *n < hi).collect();
+            let calls: Vec<(usize, Duration)> = calls.iter().copied().filter(|(n, _)| *n >= lo && *n < hi).collect();
             if calls.is_empty() {
                 return None;
             }
@@ -872,11 +924,14 @@ fn latency_json(l: &Latency) -> Value {
             Some(json!({"history": label, "calls": calls.len(), "p50_us": us(pct(times.clone(), 0.5)),
                 "p99_us": us(pct(times, 0.99)), "us_per_event_p50": us(pct(per_event, 0.5))}))
         })
-        .collect();
+        .collect()
+}
+
+fn latency_json(l: &Latency) -> Value {
     let ratios: Vec<Duration> = l
         .live_totals
         .iter()
-        .map(|(stateful, stateless)| {
+        .map(|(stateful, stateless, _)| {
             Duration::from_secs_f64(stateless.as_secs_f64() / stateful.as_secs_f64().max(1e-9))
         })
         .collect();
@@ -886,11 +941,13 @@ fn latency_json(l: &Latency) -> Value {
         "durable_install": summary(&l.install),
         "durable_submit_decision": summary(&l.submit),
         "durable_file_submit_decision": summary(&l.submit_file),
-        "stateless_call_by_history": buckets,
+        "stateless_call_by_history": by_history(&l.stateless),
+        "stateless_cached_call_by_history": by_history(&l.stateless_cached),
         "live_every_decision": {
             "trajectories": l.live_totals.len(),
             "stateful_total_ms_p50": us(pct(l.live_totals.iter().map(|t| t.0).collect(), 0.5)) / 1000.0,
             "stateless_total_ms_p50": us(pct(l.live_totals.iter().map(|t| t.1).collect(), 0.5)) / 1000.0,
+            "stateless_cached_total_ms_p50": us(pct(l.live_totals.iter().map(|t| t.2).collect(), 0.5)) / 1000.0,
             "stateless_over_stateful_p50": pct(ratios, 0.5).as_secs_f64(),
         }
     })
@@ -925,6 +982,28 @@ fn markdown(sources: &[(String, Value)]) {
             d["rejected_trajectories"]
         );
     }
+    if sources
+        .iter()
+        .any(|(_, s)| s["diff"]["history_cache"]["calls"].as_u64().unwrap_or(0) > 0)
+    {
+        println!("\n## History cache (differential pass)\n");
+        println!(
+            "| Source | Calls | Prefix hits | Exact hits | Misses | Events replayed | Events reused |"
+        );
+        println!("|---|---|---|---|---|---|---|");
+        for (name, s) in sources {
+            let c = &s["diff"]["history_cache"];
+            println!(
+                "| {name} | {} | {} | {} | {} | {} | {} |",
+                c["calls"],
+                c["prefix_hits"],
+                c["exact_hits"],
+                c["misses"],
+                c["replayed_events"],
+                c["reused_events"]
+            );
+        }
+    }
     println!("\n## Latency (single-threaded sample)\n");
     println!(
         "| Source | Sampled | Compile p50 | Durable submit p50 / p99 | On disk p50 / p99 | Stateless call p50 by history | Live, every decision: stateful / stateless (p50) |"
@@ -933,20 +1012,24 @@ fn markdown(sources: &[(String, Value)]) {
     for (name, s) in sources {
         let l = &s["latency"];
         let f = |v: &Value| format!("{:.0} µs", v.as_f64().unwrap_or(0.0));
-        let buckets: Vec<String> = l["stateless_call_by_history"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|b| {
-                        format!(
-                            "{}: {}",
-                            b["history"].as_str().unwrap_or(""),
-                            f(&b["p50_us"])
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let bucket_list = |key: &str| -> Vec<String> {
+            l[key]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|b| {
+                            format!(
+                                "{}: {}",
+                                b["history"].as_str().unwrap_or(""),
+                                f(&b["p50_us"])
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let buckets = bucket_list("stateless_call_by_history");
+        let cached = bucket_list("stateless_cached_call_by_history");
         let disk = if l["durable_file_submit_decision"]["n"].as_u64().unwrap_or(0) > 0 {
             format!(
                 "{} / {}",
@@ -959,21 +1042,34 @@ fn markdown(sources: &[(String, Value)]) {
         let live = &l["live_every_decision"];
         // Only trajectories whose every decision was timed (not sampled) count.
         let live = if live["trajectories"].as_u64().unwrap_or(0) > 0 {
-            format!(
+            let mut text = format!(
                 "{:.2} ms / {:.2} ms",
                 live["stateful_total_ms_p50"].as_f64().unwrap_or(0.0),
                 live["stateless_total_ms_p50"].as_f64().unwrap_or(0.0)
-            )
+            );
+            if !cached.is_empty() {
+                text += &format!(
+                    " / cached {:.2} ms",
+                    live["stateless_cached_total_ms_p50"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                );
+            }
+            text
         } else {
             "n/a (sampled)".to_string()
         };
+        let calls = if cached.is_empty() {
+            buckets.join(", ")
+        } else {
+            format!("{}<br>cached: {}", buckets.join(", "), cached.join(", "))
+        };
         println!(
-            "| {name} | {} | {} | {} / {} | {disk} | {} | {live} |",
+            "| {name} | {} | {} | {} / {} | {disk} | {calls} | {live} |",
             l["trajectories"],
             f(&l["compile"]["p50_us"]),
             f(&l["durable_submit_decision"]["p50_us"]),
             f(&l["durable_submit_decision"]["p99_us"]),
-            buckets.join(", "),
         );
     }
 }
@@ -1009,7 +1105,9 @@ fn main() {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(t) = trajectories.get(i) else { break };
                     let bundle = &bundles[t.bundle];
-                    let stateless = compiled.entry(t.bundle).or_insert_with(|| compile(bundle));
+                    let stateless = compiled
+                        .entry(t.bundle)
+                        .or_insert_with(|| compile(bundle, cfg.history_cache));
                     let r = diff(t, bundle, stateless, cfg.prefixes);
                     results.lock().unwrap().push((i, r));
                 }
@@ -1046,6 +1144,15 @@ fn main() {
             "isolation_compared": rs.iter().map(|r| r.isolation_compared).sum::<usize>(),
             "isolation_mismatches": rs.iter().map(|r| r.isolation_mismatches).sum::<usize>(),
             "shared_principal_groups": rs.iter().filter(|r| r.shared_principal).count(),
+            "history_cache": {
+                "capacity": cfg.history_cache,
+                "calls": rs.iter().map(|r| r.cache.calls).sum::<u64>(),
+                "prefix_hits": rs.iter().map(|r| r.cache.prefix_hits).sum::<u64>(),
+                "exact_hits": rs.iter().map(|r| r.cache.exact_hits).sum::<u64>(),
+                "misses": rs.iter().map(|r| r.cache.misses).sum::<u64>(),
+                "replayed_events": rs.iter().map(|r| r.cache.replayed_events).sum::<u64>(),
+                "reused_events": rs.iter().map(|r| r.cache.reused_events).sum::<u64>(),
+            },
         });
         all_mismatches.extend(mismatches);
 
@@ -1064,6 +1171,7 @@ fn main() {
             &bundles,
             cfg.prefixes,
             cfg.durable_dir.as_deref(),
+            cfg.history_cache,
         ));
         sources.push((name.clone(), json!({"diff": diff, "latency": latency})));
     }
@@ -1102,6 +1210,7 @@ fn main() {
         "prefixes": cfg.prefixes.map(|k| k.to_string()).unwrap_or_else(|| "all".to_string()),
         "threads": cfg.threads,
         "durable_dir": cfg.durable_dir.as_ref().map(|d| d.display().to_string()),
+        "history_cache": cfg.history_cache,
     });
     std::fs::write(&report, serde_json::to_string_pretty(&body).unwrap()).expect("write report");
     println!("report: {}", report.display());

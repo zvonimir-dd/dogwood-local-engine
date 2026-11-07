@@ -10,7 +10,8 @@ Release notes for the Dogwood local authorization engine
 
 Stateless decisions: given a whole event history, decide its last event with
 the verdict a fresh store's `submit` would give, without a store, a log or a
-clock, and keep nothing afterwards.
+clock. An optional history cache replays only what a call adds to a history it
+has seen.
 
 ### Compatibility
 
@@ -27,6 +28,13 @@ clock, and keep nothing afterwards.
   History timestamps are epoch nanoseconds; ties are spread like `submit`'s
   clamp; a decreasing timestamp or a history ending in a non-decision event is a
   `BadEvent`. Attribution tokens are placeholders (`SPref<n>`).
+- **engine**: `StatelessTemporalEngine::with_history_cache(n)` (off by default)
+  keeps the monitor state of up to `n` recent histories. A call whose history
+  extends a cached one replays only the new events, and a repeated history
+  returns its cached decision. Decisions are identical with or without the
+  cache. Each history keeps its newest state only, entries are evicted least
+  recently used first, and `clear()` (also new) drops them along with the last
+  call's state. `history_cache_stats()` returns `HistoryCacheStats`.
 - **server**: `dogwood-server decide-last POLICY --action-schema F --events F|-`,
   in-process with no server. The history is JSON Lines of `{"ts", "event"}` or a
   JSON array; `--json` and `--timings` are available; exit codes match `submit`.
@@ -34,6 +42,9 @@ clock, and keep nothing afterwards.
   differential and latency harness. `--merge K,…` interleaves corpus
   trajectories into multi-session histories and checks each member's outcomes
   are the ones it has alone (isolation under the principal pin).
+  `--history-cache N` runs the comparison through the history cache and
+  reports its hit rate; the benchmark's `stateless_cached` arm times a call that
+  extends the previous call's history.
 
 ---
 

@@ -10,6 +10,11 @@
 //!   event after `n` events of history:
 //!   - `stateless`: a compiled engine's `decide_last(history + probe)`. Every call
 //!     resets the engine and replays the whole history, so this grows with `n`.
+//!   - `stateless_cached`: the same engine with the history cache on, each call
+//!     sending the previous call's history plus the events up to the next
+//!     decision (one or two), as a live caller would. Only those are replayed;
+//!     the cached prefix is compared, not replayed. Histories run from `n` to
+//!     `n + 50` events; the call that goes back to `n` (a miss) is not timed.
 //!   - `durable_submit`: the probe's `submit` on a durable engine already holding
 //!     the history: the incremental engine's marginal cost per decision, which
 //!     stays flat because state is kept between calls. As in `decide_latency`,
@@ -23,9 +28,9 @@
 //!
 //! # Cross-check first
 //!
-//! Before any timing, every prefix of a 60-event stream is decided both ways and
-//! must agree, with a mix of allows and denies, so the timings describe the same
-//! computation.
+//! Before any timing, every prefix of a 60-event stream is decided both ways (and
+//! statelessly with the history cache) and must agree, with a mix of allows and
+//! denies, so the timings describe the same computation.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -120,6 +125,7 @@ fn cross_check(pinning: Pinning) {
     let history = events(60);
     let (mut d, clock) = durable(10, pinning);
     let mut s = stateless(10, pinning);
+    let mut cached = stateless(10, pinning).with_history_cache(1);
     let (mut allows, mut decisions) = (0, 0);
     for i in 0..history.len() {
         let want = submit(&mut d, &clock, &history[i]);
@@ -133,6 +139,11 @@ fn cross_check(pinning: Pinning) {
             "{}: event {i}: submit {want:?} vs decide_last {got:?}",
             pinning.label()
         );
+        let got_cached = cached
+            .decide_last(&history[..=i])
+            .ok()
+            .map(|x| x.response.allowed());
+        assert_eq!(want, got_cached, "{}: event {i}: cached", pinning.label());
         decisions += usize::from(want.is_some());
         allows += usize::from(want == Some(true));
     }
@@ -141,7 +152,16 @@ fn cross_check(pinning: Pinning) {
         "{}: the workload must mix allows and denies ({allows} of {decisions})",
         pinning.label()
     );
+    let stats = cached.history_cache_stats();
+    assert!(
+        stats.prefix_hits + 1 == decisions as u64 && stats.misses == 1,
+        "{}: {stats:?}",
+        pinning.label()
+    );
 }
+
+/// How far past `n` the cached arm's histories grow before going back to `n`.
+const CACHED_WINDOW: usize = 50;
 
 fn bench(c: &mut Criterion) {
     for pinning in [Pinning::Unpinned, Pinning::PinnedSession] {
@@ -174,6 +194,35 @@ fn bench(c: &mut Criterion) {
 
             // Probes continue the stream past the history, so each is a fresh event.
             let probes = events(n + 1 + 2_000);
+
+            let mut cached = stateless(POLICIES, pinning).with_history_cache(1);
+            let kinds = cached.status().decision_kinds;
+            let ends: Vec<usize> = (n..=n + CACHED_WINDOW)
+                .filter(|&i| kinds.iter().any(|k| k == probes[i].kind()))
+                .collect();
+            assert!(ends.len() > 10, "decisions in the window: {}", ends.len());
+            decide.bench_function(id("stateless_cached"), |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for k in 0..iters as usize {
+                        let step = k % (ends.len() - 1);
+                        if step == 0 {
+                            // Back to the start of the window: a miss, untimed.
+                            cached.decide_last(&probes[..=ends[0]]).expect("decides");
+                        }
+                        let history = &probes[..=ends[step + 1]];
+                        let started = Instant::now();
+                        cached.decide_last(history).expect("decides");
+                        total += started.elapsed();
+                    }
+                    total
+                })
+            });
+            let stats = cached.history_cache_stats();
+            assert!(
+                stats.prefix_hits > 10 * stats.misses,
+                "cached arm hit rate: {stats:?}"
+            );
             decide.bench_function(id("durable_submit"), |b| {
                 b.iter_custom(|iters| {
                     let (mut d, clock) = durable(POLICIES, pinning);

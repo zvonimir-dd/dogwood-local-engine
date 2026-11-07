@@ -30,7 +30,7 @@ pub use tick::TickRate;
 pub use clock::{Clock, WallClock};
 pub use durable::{
     Applied, BatchResult, Decided, DecisionDiagnostics, DecisionResponse, DurableConfig,
-    DurableError, DurableTemporalEngine, Installed, Outcome, PolicyAttribution,
+    DurableError, DurableTemporalEngine, HistoryCacheStats, Installed, Outcome, PolicyAttribution,
     StatelessTemporalEngine, Status, Submitted, decide_last,
 };
 pub use policy_store::{BatchError, PolicyEntry, PolicyId, PolicySet, PolicyToken, Verb};

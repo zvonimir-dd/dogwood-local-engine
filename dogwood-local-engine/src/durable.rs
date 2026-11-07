@@ -36,7 +36,8 @@ use std::time::Duration;
 use dogwood_language::cedar::Schema;
 use dogwood_language::{
     Authorizer, DogwoodRuleRef, Event, EventBuilder, EventSignature, LoweredPolicySet,
-    ParsedPolicySet, PolicySchema, ServiceSchema, TemporalEngine, TemporalField, Validator,
+    ParsedPolicySet, PartitionKey, PolicySchema, ServiceSchema, TemporalEngine, TemporalField,
+    Validator,
 };
 
 use crate::clock::{Clock, WallClock};
@@ -55,7 +56,7 @@ mod stateless;
 
 pub use attribution::{DecisionDiagnostics, DecisionResponse, PolicyAttribution};
 use attribution::{RuleAttribution, attribute_response, build_attributions};
-pub use stateless::{Decided, StatelessTemporalEngine, decide_last};
+pub use stateless::{Decided, HistoryCacheStats, StatelessTemporalEngine, decide_last};
 
 /// Metadata slot recording the unit this store's timestamps were assigned in.
 const META_TIME_UNIT: &str = "dogwood_server_time_unit";
@@ -1957,9 +1958,28 @@ struct Preparation {
     schema: Schema,
     event_signatures: Vec<EventSignature>,
     policy_ids: Vec<PolicyId>,
+    /// The schema's partition keys when it declares pins, else empty.
+    partition_keys: Vec<PartitionKey>,
 }
 
 impl Preparation {
+    /// A new engine configured for this set (tick rate, partition keys), not yet
+    /// prepared.
+    fn unprepared(&self) -> LocalTemporalEngine {
+        let mut engine = LocalTemporalEngine::new().with_tick_rate(TIME_UNIT);
+        if !self.partition_keys.is_empty() {
+            engine.set_partition_keys(&self.partition_keys);
+        }
+        engine
+    }
+
+    /// A new, empty engine in the state `compile` leaves its own engine in.
+    fn fresh(&self) -> Result<LocalTemporalEngine, DurableError> {
+        let mut engine = self.unprepared();
+        self.reset(&mut engine)?;
+        Ok(engine)
+    }
+
     /// Rebuild `engine`'s monitors over the leaves, discarding all their state.
     fn prepare_leaves(&self, engine: &mut LocalTemporalEngine) -> Result<(), DurableError> {
         engine
@@ -2031,16 +2051,18 @@ fn compile(installed: &Installed, service: &ServiceSchema) -> Result<Compiled, D
     let event_signatures: Vec<_> = lowered.event_signatures().collect();
 
     // Prepare a fresh engine over the new leaves; the caller gives it state.
-    let mut engine = LocalTemporalEngine::new().with_tick_rate(TIME_UNIT);
-    if partitioned {
-        engine.set_partition_keys(lowered.partition_keys());
-    }
     let preparation = Preparation {
         leaves,
         schema,
         event_signatures,
         policy_ids,
+        partition_keys: if partitioned {
+            lowered.partition_keys().to_vec()
+        } else {
+            Vec::new()
+        },
     };
+    let mut engine = preparation.unprepared();
     preparation.prepare_leaves(&mut engine)?;
     let incremental_leaves = engine.incremental_leaf_count();
     let leaf_keys = engine.leaf_keys();

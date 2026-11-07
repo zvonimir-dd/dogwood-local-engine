@@ -257,8 +257,8 @@ test fixture) and the question is only what the verdict on its last event would
 be. `StatelessTemporalEngine` answers that without a store. It compiles a
 policy set exactly as `install` does, and `decide_last` takes the whole history,
 in time order, and returns the decision `submit` would give the last event on a
-fresh store that had received the same events at the same times. Nothing is kept
-from one call to the next.
+fresh store that had received the same events at the same times. By default
+nothing is kept from one call to the next.
 
 ```rust
 use dogwood_language::{Event, Value};
@@ -348,6 +348,87 @@ A few things to know about `decide_last`:
 - `decide_last(policy, schema, event_schema, macros, history)` is the one-shot
   form, and `dogwood-server decide-last` does the same from the command line,
   reading the history from a JSON Lines file.
+
+### Caching histories
+
+A live caller usually sends the same history again with a few more events.
+`with_history_cache(n)` keeps the monitor state of up to `n` recent histories:
+
+```rust
+# use dogwood_language::{Event, Value};
+# use dogwood_local_engine::{DurableError, StatelessTemporalEngine};
+# const POLICY: &str = r#"
+# @id("allow_login")
+# permit (principal, action == Drupe::Action::"Login", resource);
+# @id("read_after_login")
+# permit (principal, action == Drupe::Action::"Read", resource)
+# when temporal {
+#     formerly within 1h Drupe::Action::"Login"::response{ input.user: context.input.user }
+# };
+# "#;
+# const SCHEMA: &str = r#"
+# namespace Drupe {
+#   type LoginInput = { user: String };
+#   type ReadInput = { user: String };
+#   entity Gateway;
+#   entity OAuthUser = { id: String } tags String;
+#   action "Login" appliesTo {
+#     principal: [OAuthUser], resource: [Gateway], context: { input: LoginInput }
+#   };
+#   action "Read" appliesTo {
+#     principal: [OAuthUser], resource: [Gateway], context: { input: ReadInput }
+#   };
+# }
+# "#;
+# const SECOND: i64 = 1_000_000_000;
+#
+# /// One of alice's events, `at` seconds into the session. Unlike with `submit`,
+# /// every event carries its own timestamp, in nanoseconds.
+# fn alice(action: &str, kind: &str, at: i64) -> Event {
+#     Event::builder(action, kind)
+#         .principal("Drupe::OAuthUser::\"alice\"")
+#         .resource("Drupe::Gateway::\"gw1\"")
+#         .field("input", "user", Value::String("alice".to_string()))
+#         .request_context("input", "user", Value::String("alice".to_string()))
+#         .timestamp(at * SECOND)
+#         .build()
+# }
+#
+# fn main() -> Result<(), DurableError> {
+# let session = [
+#     alice("Drupe::Action::Login", "request", 0),
+#     alice("Drupe::Action::Login", "response", 5),
+#     alice("Drupe::Action::Read", "request", 10),
+#     alice("Drupe::Action::Read", "request", 7200),
+# ];
+let mut engine = StatelessTemporalEngine::new(POLICY, SCHEMA, None, None)?
+    .with_history_cache(16);
+engine.decide_last(&session[..3])?; // a miss: replays 3 events
+engine.decide_last(&session)?; // extends the cached history: replays 1
+engine.decide_last(&session)?; // the same history again: replays none
+
+let stats = engine.history_cache_stats();
+assert_eq!((stats.misses, stats.prefix_hits, stats.exact_hits), (1, 1, 1));
+assert_eq!((stats.replayed_events, stats.reused_events), (4, 7));
+# Ok(())
+# }
+```
+
+- Decisions are the same with or without the cache. The cache changes how much is
+  replayed, never what is decided.
+- A cached history is used only when the new history starts with exactly its
+  events, timestamps included. Anything else is a miss and replays the whole
+  history, as without the cache.
+- Each history keeps only its newest state. A call that goes back to an earlier
+  point of a cached history is a miss.
+- A hit still compares the cached events with the new history's. That costs far
+  less than replaying them, but it grows with the history.
+- Each entry holds its events and its monitors' state, which window expiry
+  bounds. Under a pinned schema each entry also keeps a background thread, so
+  keep `n` small (16 is plenty for one caller's live sessions). Entries are
+  evicted least recently used first, and `clear()` drops them all.
+- `history_cache_stats()` counts calls, exact and prefix hits, misses, and the
+  events reused and replayed. Subtract two readings for one call's figures.
 
 ## What the embedding application must still do
 

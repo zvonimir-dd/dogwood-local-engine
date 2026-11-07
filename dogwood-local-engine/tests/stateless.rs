@@ -15,6 +15,10 @@
 //! run under the default, pinned event schema (partitioned monitors), the
 //! unpinned schema (global monitors), and with an aggregate rule. No temp files:
 //! the durable side runs on an in-memory log.
+//!
+//! The history cache is held to the uncached engine: on every prefix of the same
+//! histories, at several capacities, its decisions are identical, and its
+//! counters show which calls replayed what.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -25,7 +29,8 @@ use std::time::Duration;
 use dogwood_language::{Event, EventBuilder, UNPINNED_EVENT_SCHEMA, Value};
 use dogwood_local_engine::{
     Clock, Decided, DecisionResponse, DurableConfig, DurableError, DurableLog,
-    DurableTemporalEngine, Outcome, StatelessTemporalEngine, Submitted, decide_last,
+    DurableTemporalEngine, HistoryCacheStats, Outcome, StatelessTemporalEngine, Submitted,
+    decide_last,
 };
 
 const SECOND: i64 = 1_000_000_000;
@@ -544,4 +549,332 @@ fn placeholder_tokens_name_the_policies_in_order() {
 fn the_engine_is_send() {
     fn send<T: Send>() {}
     send::<StatelessTemporalEngine>();
+}
+
+// ---- The history cache ------------------------------------------------------
+
+fn events_of(steps: &[(i64, Spec)]) -> Vec<Event> {
+    steps
+        .iter()
+        .map(|(ts, s)| s.builder().timestamp(*ts).build())
+        .collect()
+}
+
+fn assert_same_result(
+    what: &str,
+    plain: &Result<Decided, DurableError>,
+    cached: &Result<Decided, DurableError>,
+) {
+    match (plain, cached) {
+        (Ok(a), Ok(b)) => assert_eq!(normalized(a), normalized(b), "{what}"),
+        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{what}"),
+        (a, b) => panic!("{what}: uncached {a:?}, cached {b:?}"),
+    }
+}
+
+/// What one call did, from two readings of the counters.
+fn delta(before: HistoryCacheStats, after: HistoryCacheStats) -> HistoryCacheStats {
+    HistoryCacheStats {
+        calls: after.calls - before.calls,
+        exact_hits: after.exact_hits - before.exact_hits,
+        prefix_hits: after.prefix_hits - before.prefix_hits,
+        misses: after.misses - before.misses,
+        reused_events: after.reused_events - before.reused_events,
+        replayed_events: after.replayed_events - before.replayed_events,
+    }
+}
+
+fn miss(replayed: u64) -> HistoryCacheStats {
+    HistoryCacheStats {
+        calls: 1,
+        misses: 1,
+        replayed_events: replayed,
+        ..HistoryCacheStats::default()
+    }
+}
+
+fn prefix_hit(reused: u64, replayed: u64) -> HistoryCacheStats {
+    HistoryCacheStats {
+        calls: 1,
+        prefix_hits: 1,
+        reused_events: reused,
+        replayed_events: replayed,
+        ..HistoryCacheStats::default()
+    }
+}
+
+fn exact_hit(reused: u64) -> HistoryCacheStats {
+    HistoryCacheStats {
+        calls: 1,
+        exact_hits: 1,
+        reused_events: reused,
+        ..HistoryCacheStats::default()
+    }
+}
+
+/// Decide every prefix with the cache at `capacity` and without it: identical
+/// results, and each call after the first decision replays only the events since
+/// the previous one. Returns the counters.
+fn assert_cache_transparent(
+    policy: &str,
+    event_schema: Option<&str>,
+    steps: &[(i64, Spec)],
+    capacity: usize,
+) -> HistoryCacheStats {
+    let events = events_of(steps);
+    let mut plain =
+        StatelessTemporalEngine::new(policy, ACTION_SCHEMA, event_schema, None).unwrap();
+    let mut cached = StatelessTemporalEngine::new(policy, ACTION_SCHEMA, event_schema, None)
+        .unwrap()
+        .with_history_cache(capacity);
+    // The end of the history the cache holds, if any.
+    let mut held: Option<usize> = None;
+    for i in 0..events.len() {
+        let before = cached.history_cache_stats();
+        let a = plain.decide_last(&events[..=i]);
+        let b = cached.decide_last(&events[..=i]);
+        let what = format!("capacity {capacity}, #{i} {:?}", steps[i].1);
+        assert_same_result(&what, &a, &b);
+        let did = delta(before, cached.history_cache_stats());
+        match &b {
+            Ok(_) => {
+                let expected = match held {
+                    Some(h) => prefix_hit(h as u64 + 1, (i - h) as u64),
+                    None => miss(i as u64 + 1),
+                };
+                assert_eq!(did, expected, "{what}");
+                held = Some(i);
+            }
+            // Refused before the cache is consulted.
+            Err(DurableError::BadEvent(m)) if m.contains("not a decision kind") => {
+                assert_eq!(
+                    did,
+                    HistoryCacheStats {
+                        calls: 1,
+                        ..HistoryCacheStats::default()
+                    },
+                    "{what}"
+                );
+            }
+            // A failed decision (an undeclared action) drops the history.
+            Err(_) => held = None,
+        }
+    }
+    cached.history_cache_stats()
+}
+
+/// (policy, event schema, scripted steps).
+type Case = (&'static str, Option<&'static str>, Vec<(i64, Spec)>);
+
+#[test]
+fn the_history_cache_changes_no_decision() {
+    let cases: Vec<Case> = vec![
+        (POLICY, None, script(1, 160)),
+        (POLICY, None, script(2, 160)),
+        (POLICY, Some(UNPINNED_EVENT_SCHEMA), script(11, 160)),
+        (POLICY, Some(UNPINNED_EVENT_SCHEMA), script(12, 160)),
+        (BUDGET, None, budget_script(21, 200)),
+        (BUDGET, Some(UNPINNED_EVENT_SCHEMA), budget_script(22, 200)),
+    ];
+    for (policy, schema, steps) in &cases {
+        for capacity in [1, 2, 16] {
+            let stats = assert_cache_transparent(policy, *schema, steps, capacity);
+            assert!(
+                stats.prefix_hits > 40 && stats.prefix_hits > 5 * stats.misses,
+                "{schema:?}, capacity {capacity}: {stats:?}"
+            );
+        }
+    }
+}
+
+/// `n` steps of a script without undeclared actions, `offset` nanoseconds later,
+/// so histories built from different offsets never share a first event.
+fn clean_script(seed: u64, n: usize, offset: i64) -> Vec<Event> {
+    script(seed, n)
+        .into_iter()
+        .filter(|(_, s)| s.action != "Nope")
+        .map(|(ts, s)| s.builder().timestamp(ts + offset).build())
+        .collect()
+}
+
+/// The prefix ends at which `events` has a decision (a request).
+fn decision_ends(events: &[Event]) -> Vec<usize> {
+    (0..events.len())
+        .filter(|&i| events[i].kind() == "request")
+        .collect()
+}
+
+#[test]
+fn interleaved_histories_hit_when_the_cache_holds_them_all() {
+    let lines: Vec<Vec<Event>> = (0..3)
+        .map(|h| clean_script(30 + h as u64, 120, h))
+        .collect();
+    let ends: Vec<Vec<usize>> = lines.iter().map(|l| decision_ends(l)).collect();
+    let rounds = ends.iter().map(Vec::len).min().unwrap();
+    assert!(rounds > 30, "{rounds}");
+
+    let mut plain = StatelessTemporalEngine::new(POLICY, ACTION_SCHEMA, None, None).unwrap();
+    let mut roomy = StatelessTemporalEngine::new(POLICY, ACTION_SCHEMA, None, None)
+        .unwrap()
+        .with_history_cache(3);
+    let mut cramped = StatelessTemporalEngine::new(POLICY, ACTION_SCHEMA, None, None)
+        .unwrap()
+        .with_history_cache(1);
+    for round in 0..rounds {
+        for (h, line) in lines.iter().enumerate() {
+            let history = &line[..=ends[h][round]];
+            let expected = plain.decide_last(history);
+            let what = format!("round {round}, history {h}");
+            assert_same_result(&what, &expected, &roomy.decide_last(history));
+            assert_same_result(&what, &expected, &cramped.decide_last(history));
+        }
+    }
+    let calls = 3 * rounds as u64;
+    let roomy = roomy.history_cache_stats();
+    assert_eq!(
+        (roomy.misses, roomy.prefix_hits),
+        (3, calls - 3),
+        "{roomy:?}"
+    );
+    let cramped = cramped.history_cache_stats();
+    assert_eq!(
+        (cramped.misses, cramped.prefix_hits),
+        (calls, 0),
+        "{cramped:?}"
+    );
+}
+
+#[test]
+fn a_history_that_differs_anywhere_is_a_miss() {
+    let base = clean_script(40, 60, 0);
+    let ends = decision_ends(&base);
+    let end = ends[ends.len() - 1];
+    let history = &base[..=end];
+    let mut plain = StatelessTemporalEngine::new(POLICY, ACTION_SCHEMA, None, None).unwrap();
+    let mut cached = StatelessTemporalEngine::new(POLICY, ACTION_SCHEMA, None, None)
+        .unwrap()
+        .with_history_cache(16);
+    cached.decide_last(history).unwrap();
+
+    let mid = end / 2;
+    // One event changed in the middle: another principal.
+    let mut changed_event = history.to_vec();
+    let who = if changed_event[mid]
+        .principal()
+        .is_some_and(|p| p.contains("alice"))
+    {
+        "bob"
+    } else {
+        "alice"
+    };
+    changed_event[mid] = changed_event[mid]
+        .clone()
+        .into_builder()
+        .principal(&format!("User::\"{who}\""))
+        .build();
+    // One timestamp moved a nanosecond (still in order).
+    let mut changed_time = history.to_vec();
+    let mut moved = mid;
+    while history[moved + 1].timestamp() == history[moved].timestamp() {
+        moved += 1;
+    }
+    changed_time[moved] = history[moved]
+        .clone()
+        .into_builder()
+        .timestamp(history[moved].timestamp() + 1)
+        .build();
+    // The same change, with the history extended past the cached one.
+    let mut changed_and_longer = changed_event.clone();
+    changed_and_longer.push(export(history[end].timestamp() + SECOND, "alice"));
+
+    // Each variant is cached once decided, so the longer one goes first: the
+    // others would be prefixes of it, not extensions.
+    for (what, variant) in [
+        ("changed and longer", &changed_and_longer),
+        ("an event changed", &changed_event),
+        ("a timestamp changed", &changed_time),
+    ] {
+        assert_ne!(variant.as_slice(), history, "{what}");
+        let before = cached.history_cache_stats();
+        let got = cached.decide_last(variant);
+        assert_same_result(what, &plain.decide_last(variant), &got);
+        assert_eq!(
+            delta(before, cached.history_cache_stats()),
+            miss(variant.len() as u64),
+            "{what}"
+        );
+    }
+
+    // Another bundle's engine has its own cache.
+    let mut other = StatelessTemporalEngine::new(BUDGET, ACTION_SCHEMA, None, None)
+        .unwrap()
+        .with_history_cache(16);
+    let _ = other.decide_last(history);
+    assert_eq!(other.history_cache_stats().misses, 1);
+}
+
+#[test]
+fn an_earlier_point_is_a_miss_and_a_repeat_is_an_exact_hit() {
+    let line = clean_script(50, 80, 0);
+    let ends = decision_ends(&line);
+    let (a, b, c) = (ends[5], ends[10], ends[15]);
+    assert!(a < b && b < c);
+    let mut plain = StatelessTemporalEngine::new(POLICY, ACTION_SCHEMA, None, None).unwrap();
+    for capacity in [1, 2] {
+        let mut e = StatelessTemporalEngine::new(POLICY, ACTION_SCHEMA, None, None)
+            .unwrap()
+            .with_history_cache(capacity);
+        let mut call = |end: usize, expected: HistoryCacheStats| {
+            let before = e.history_cache_stats();
+            let got = e.decide_last(&line[..=end]).unwrap();
+            let what = format!("capacity {capacity}, ..={end}");
+            assert_same_result(&what, &plain.decide_last(&line[..=end]), &Ok(got.clone()));
+            assert_eq!(delta(before, e.history_cache_stats()), expected, "{what}");
+            got
+        };
+        call(a, miss(a as u64 + 1));
+        let first_c = call(c, prefix_hit(a as u64 + 1, (c - a) as u64));
+        // The cache holds ..=c only: ..=b is an earlier point of it.
+        call(b, miss(b as u64 + 1));
+        let again = if capacity == 1 {
+            // ..=b displaced ..=c, and ..=c extends it.
+            call(c, prefix_hit(b as u64 + 1, (c - b) as u64))
+        } else {
+            call(c, exact_hit(c as u64 + 1))
+        };
+        assert_eq!(again, first_c, "capacity {capacity}: identical decision");
+        // An immediate repeat is always exact, Decided and all.
+        assert_eq!(call(c, exact_hit(c as u64 + 1)), first_c);
+    }
+}
+
+#[test]
+fn the_least_recently_used_history_is_evicted_first_and_clear_empties_the_cache() {
+    let lines: Vec<Vec<Event>> = (0..3).map(|h| clean_script(60 + h as u64, 80, h)).collect();
+    let ends: Vec<Vec<usize>> = lines.iter().map(|l| decision_ends(l)).collect();
+    let mut e = StatelessTemporalEngine::new(POLICY, ACTION_SCHEMA, None, None)
+        .unwrap()
+        .with_history_cache(2);
+    let call = |e: &mut StatelessTemporalEngine, h: usize, round: usize| {
+        let before = e.history_cache_stats();
+        e.decide_last(&lines[h][..=ends[h][round]]).unwrap();
+        let did = delta(before, e.history_cache_stats());
+        (did.misses, did.prefix_hits)
+    };
+    assert_eq!(call(&mut e, 0, 0), (1, 0)); // A
+    assert_eq!(call(&mut e, 1, 0), (1, 0)); // B
+    assert_eq!(call(&mut e, 0, 1), (0, 1)); // A again: B is now the least recent
+    assert_eq!(call(&mut e, 2, 0), (1, 0)); // C evicts B
+    assert_eq!(call(&mut e, 0, 2), (0, 1), "A was kept");
+    assert_eq!(call(&mut e, 2, 1), (0, 1), "C was kept");
+    assert_eq!(call(&mut e, 1, 1), (1, 0), "B was evicted");
+
+    e.clear().unwrap();
+    assert_eq!(call(&mut e, 0, 3), (1, 0), "cleared");
+    assert_eq!(call(&mut e, 0, 4), (0, 1), "and caching again");
+    // Turning the cache off drops it, and calls are no longer counted.
+    let mut e = e.with_history_cache(0);
+    let before = e.history_cache_stats();
+    e.decide_last(&lines[0][..=ends[0][5]]).unwrap();
+    assert_eq!(e.history_cache_stats(), before);
 }
